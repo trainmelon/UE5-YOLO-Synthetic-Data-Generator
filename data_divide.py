@@ -4,12 +4,12 @@ import shutil
 from pathlib import Path
 
 # 配置路径
-source_dir = "D:/Dataset_Output_Full/data"  # 数据源路径配置
+source_dir = "D:/Dataset_Output_Full/data_v2"  # 数据源路径配置
 img_src_dir = os.path.join(source_dir, "images")
 lbl_src_dir = os.path.join(source_dir, "labels")
 
 # YOLO 标准数据集输出路径
-yolo_base_dir = "D:/YOLO_Dataset"  # 数据输出路径配置
+yolo_base_dir = "D:/YOLO_Dataset_v2"  # 数据输出路径配置
 
 # 划分比例
 train_ratio = 0.8

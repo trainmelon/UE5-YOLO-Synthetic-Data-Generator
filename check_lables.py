@@ -2,7 +2,7 @@ import cv2
 import os
 
 # 1. 数据集路径配置
-data_dir = "D:/Dataset_Output_Test/data"
+data_dir = "D:/Dataset_Output_Full/data_v2"
 img_dir = os.path.join(data_dir, "images")
 lbl_dir = os.path.join(data_dir, "labels")
 vis_dir = os.path.join(data_dir, "visualized")  # 存放画好框的验证图片

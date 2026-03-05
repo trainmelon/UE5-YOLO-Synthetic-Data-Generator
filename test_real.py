@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 
-# 1. 加载训练出来的最高分权重 (注意替换为实际的准确路径)
-model = YOLO('C:/Users/24281/PycharmProjects/Binance/runs/detect/UE5_Drone_Detection/v1_baseline3/weights/best.pt')
+# 1. 加载训练出来的最高分权重 (注意替换路径)
+model = YOLO('C:/Users/24281/PycharmProjects/Binance/runs/detect/UE5_Drone_Detection/v2_baseline/weights/best.pt')
 
 if __name__ == '__main__':
     # 2. 让模型去预测真实世界的图片或视频

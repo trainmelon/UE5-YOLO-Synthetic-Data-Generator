@@ -6,26 +6,18 @@ import math
 import time
 
 # ==========================================
-# 后台可能的残留实例清理，确保本次运行环境干净
+# 僵尸杀手：确保每次运行都是全新的干净环境
 # ==========================================
-old_handles = [
-    "_global_batch_tick_handle", "_active_pie_generator", 
-    "_standard_generator_tick", "_golden_batch_tick_handle", 
-    "_heavy_armor_tick", "_final_golden_tick", "_golden_production_tick",
-    "_ultimate_golden_production"
-]
-for attr in old_handles:
-    if hasattr(unreal, attr):
-        handle = getattr(unreal, attr)
-        if handle:
-            try: unreal.unregister_slate_post_tick_callback(handle)
-            except: pass
-        setattr(unreal, attr, None)
+if hasattr(unreal, "_golden_batch_tick_handle") and unreal._golden_batch_tick_handle:
+    try:
+        unreal.unregister_slate_post_tick_callback(unreal._golden_batch_tick_handle)
+        unreal.log_warning(">> 已清理后台旧任务。")
+    except: pass
+unreal._golden_batch_tick_handle = None
 
-class UltimateGoldenProduction:
+class ExhaustiveBirdseyeGenerator:
     def __init__(self):
-        # 1. 修改为正式数据集输出路径
-        self.output_dir = "D:/Dataset_Output_Full/data"
+        self.output_dir = "D:/Dataset_Output_Full/data_v2"
         self.img_dir = os.path.join(self.output_dir, "images")
         self.lbl_dir = os.path.join(self.output_dir, "labels")
         self.kill_switch = os.path.join(self.output_dir, "STOP.txt")
@@ -38,21 +30,19 @@ class UltimateGoldenProduction:
             "Turbine": 0, "Tower": 1, "Car": 2, "Ship": 3
         }
         
-        # 2. 生成总量调整（此处默认为 5000 张）
-        self.total_images = 5000  
+        # 【核心修改 1：产线规模拉满】设定为 300 张高质量群像图
+        self.total_images = 300  
         self.current_count = 0
         
-        # 时序控制，用于兼容低性能机器，确保每一步都有足够时间完成，可以适当调整参数
         self.wait_time = 3.0           
         self.save_time = 1.0           
         self.warmup_time_first = 8.0   
         self.warmup_time_light = 5.0   
         
-        self.target_time = 0.0
         self.state = "COLD_START" 
+        self.target_time = 0.0
         
-        self.current_actor = None
-        self.current_class_id = None
+        self.all_valid_actors = [] 
         self.cam_loc = None
         self.cam_rot = None
         
@@ -66,6 +56,7 @@ class UltimateGoldenProduction:
             os.remove(self.kill_switch)
 
     def force_change_lighting(self, phase):
+        # 光照切换：早晨、正午、黄昏
         pitch_map = {0: -15.0, 1: -80.0, 2: -5.0}
         target_pitch = pitch_map.get(phase, -45.0)
         time_map = {0: 7.0, 1: 12.0, 2: 17.5}
@@ -84,19 +75,10 @@ class UltimateGoldenProduction:
             for actor in actors:
                 light_comps = actor.get_components_by_class(unreal.DirectionalLightComponent.static_class())
                 for comp in light_comps:
-                    new_rot = unreal.Rotator(pitch=target_pitch, yaw=random.uniform(0, 360), roll=0.0)
-                    comp.set_world_rotation(new_rot, False, False)
-        except: pass
-            
-        try:
-            sky_lights = unreal.GameplayStatics.get_all_actors_of_class(self.world, unreal.SkyLight.static_class())
-            for sky in sky_lights:
-                sky_comp = sky.get_component_by_class(unreal.SkyLightComponent.static_class())
-                if sky_comp: sky_comp.recapture_sky()
+                    comp.set_world_rotation(unreal.Rotator(pitch=target_pitch, yaw=random.uniform(0, 360), roll=0.0), False, False)
         except: pass
 
     def project_3d_to_2d_math(self, target_loc, cam_loc, cam_rot):
-        #  3D-2D 投影算法
         dx = target_loc.x - cam_loc.x
         dy = target_loc.y - cam_loc.y
         dz = target_loc.z - cam_loc.z
@@ -119,9 +101,7 @@ class UltimateGoldenProduction:
         
         if local_x <= 0: return None
             
-        half_fov_rad = math.radians(self.fov / 2.0)
-        plane_dist = (self.res_x / 2.0) / math.tan(half_fov_rad)
-        
+        plane_dist = (self.res_x / 2.0) / math.tan(math.radians(self.fov / 2.0))
         proj_y = (local_y / local_x) * plane_dist
         proj_z = (local_z / local_x) * plane_dist
         
@@ -130,8 +110,38 @@ class UltimateGoldenProduction:
         
         return unreal.Vector2D(screen_x, screen_y)
 
-    def calculate_yolo_label(self):
-        origin, extent = self.current_actor.get_actor_bounds(False, False)
+    def check_occlusion_for_actor(self, actor):
+        origin, extent = actor.get_actor_bounds(False, False)
+        test_points = [
+            origin,
+            origin + unreal.Vector(extent.x, extent.y, extent.z),
+            origin + unreal.Vector(extent.x, extent.y, -extent.z),
+            origin + unreal.Vector(extent.x, -extent.y, extent.z),
+            origin + unreal.Vector(extent.x, -extent.y, -extent.z),
+            origin + unreal.Vector(-extent.x, extent.y, extent.z),
+            origin + unreal.Vector(-extent.x, extent.y, -extent.z),
+            origin + unreal.Vector(-extent.x, -extent.y, extent.z),
+            origin + unreal.Vector(-extent.x, -extent.y, -extent.z)
+        ]
+        
+        visible_count = 0
+        for pt in test_points:
+            try:
+                hit = unreal.SystemLibrary.sphere_trace_single(
+                    world_context_object=self.world, start=self.cam_loc, end=pt,
+                    radius=15.0, trace_channel=unreal.TraceTypeQuery.TRACE_TYPE_QUERY1,
+                    trace_complex=True, actors_to_ignore=[actor], 
+                    draw_debug_type=unreal.DrawDebugTrace.NONE, ignore_self=True
+                )
+                if not (hit and getattr(hit, 'blocking_hit', False) and hit.actor):
+                    visible_count += 1
+            except: pass 
+
+        if (visible_count / 9.0) >= 0.3: return True 
+        else: return False
+
+    def calculate_yolo_label_for_actor(self, actor, class_id):
+        origin, extent = actor.get_actor_bounds(False, False)
         corners = [
             origin + unreal.Vector(extent.x, extent.y, extent.z),
             origin + unreal.Vector(extent.x, extent.y, -extent.z),
@@ -158,86 +168,60 @@ class UltimateGoldenProduction:
         
         if valid_points == 0: return None
 
-        min_x = max(0, min_x); min_y = max(0, min_y)
-        max_x = min(self.res_x, max_x); max_y = min(self.res_y, max_y)
+        if max_x < 0 or min_x > self.res_x or max_y < 0 or min_y > self.res_y: return None
 
-        if min_x >= max_x or min_y >= max_y: return None
+        clamped_min_x = max(0, min_x)
+        clamped_min_y = max(0, min_y)
+        clamped_max_x = min(self.res_x, max_x)
+        clamped_max_y = min(self.res_y, max_y)
 
-        center_x = ((min_x + max_x) / 2.0) / self.res_x
-        center_y = ((min_y + max_y) / 2.0) / self.res_y
-        width = (max_x - min_x) / self.res_x
-        height = (max_y - min_y) / self.res_y
+        pixel_w = clamped_max_x - clamped_min_x
+        pixel_h = clamped_max_y - clamped_min_y
 
-        return f"{self.current_class_id} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}\n"
+        if pixel_w < 15 or pixel_h < 15: return None
+        if not self.check_occlusion_for_actor(actor): return None
+
+        center_x = ((clamped_min_x + clamped_max_x) / 2.0) / self.res_x
+        center_y = ((clamped_min_y + clamped_max_y) / 2.0) / self.res_y
+        width = pixel_w / self.res_x
+        height = pixel_h / self.res_y
+
+        return f"{class_id} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}\n"
 
     def get_all_tags(self, actor):
         tags = [str(tag) for tag in actor.tags]
         try:
-            components = actor.get_components_by_class(unreal.ActorComponent.static_class())
-            for comp in components: tags.extend([str(tag) for tag in comp.component_tags])
+            for comp in actor.get_components_by_class(unreal.ActorComponent.static_class()): 
+                tags.extend([str(tag) for tag in comp.component_tags])
         except: pass
         return list(set(tags))
-
-    def check_occlusion_multi_ray(self):
-        #  9点球体射线遮挡检测
-        origin, extent = self.current_actor.get_actor_bounds(False, False)
-        test_points = [
-            origin,
-            origin + unreal.Vector(extent.x, extent.y, extent.z),
-            origin + unreal.Vector(extent.x, extent.y, -extent.z),
-            origin + unreal.Vector(extent.x, -extent.y, extent.z),
-            origin + unreal.Vector(extent.x, -extent.y, -extent.z),
-            origin + unreal.Vector(-extent.x, extent.y, extent.z),
-            origin + unreal.Vector(-extent.x, extent.y, -extent.z),
-            origin + unreal.Vector(-extent.x, -extent.y, extent.z),
-            origin + unreal.Vector(-extent.x, -extent.y, -extent.z)
-        ]
-        
-        visible_count = 0
-        for pt in test_points:
-            try:
-                hit_result = unreal.SystemLibrary.sphere_trace_single(
-                    world_context_object=self.world, start=self.cam_loc, end=pt,
-                    radius=15.0, trace_channel=unreal.TraceTypeQuery.TRACE_TYPE_QUERY1,
-                    trace_complex=True, actors_to_ignore=[self.current_actor], 
-                    draw_debug_type=unreal.DrawDebugTrace.NONE, ignore_self=True
-                )
-                if not (hit_result and getattr(hit_result, 'blocking_hit', False) and hit_result.actor):
-                    visible_count += 1
-            except: pass 
-
-        visibility_ratio = visible_count / 9.0
-        if visibility_ratio >= 0.4: return False 
-        else: return True 
 
     def _on_tick(self, delta_time):
         try:
             if os.path.exists(self.kill_switch):
-                unreal.log_error("检测到 STOP.txt，程序已安全终止！")
                 self.stop()
                 return
 
             if self.current_count >= self.total_images:
-                unreal.log(f"=== 成功完成 {self.total_images} 张完整数据集生成！ ===")
+                unreal.log("=== 300 张高质量群像数据集生成完毕！ ===")
                 self.stop()
                 return
 
             now = time.time()
 
             if self.state == "COLD_START":
-                unreal.log(f"执行初始引擎热身与底图加载，请等待 {self.warmup_time_first} 秒...")
+                unreal.log("执行引擎热身...")
                 self.target_time = now + self.warmup_time_first
                 self.state = "WAIT_COLD_START" 
-                return
 
             elif self.state == "WAIT_COLD_START":
                 if now >= self.target_time: self.state = "MOVE_CAMERA" 
-                return
 
             elif self.state == "MOVE_CAMERA":
                 current_phase_wait = self.wait_time
                 
-                # 光照阶梯变化
+                # 【光照阶梯切换逻辑】
+                # 前100张早晨，中100张正午，后100张黄昏
                 if self.current_count == 0:
                     unreal.log(">> 切换至【早晨】光照阶段")
                     self.force_change_lighting(0)
@@ -250,88 +234,90 @@ class UltimateGoldenProduction:
                     unreal.log(">> 切换至【黄昏】光照阶段")
                     self.force_change_lighting(2)
                     current_phase_wait = self.warmup_time_light
-
+                
                 all_actors = unreal.GameplayStatics.get_all_actors_of_class(self.world, unreal.Actor.static_class())
-                categorized_targets = {0:[], 1:[], 2:[], 3:[]}
+                
+                categorized_actors = {0: [], 1: [], 2: [], 3: []}
+                self.all_valid_actors = [] 
+                
                 for actor in all_actors:
-                    tags = self.get_all_tags(actor)
-                    for tag in tags:
+                    for tag in self.get_all_tags(actor):
                         if tag in self.class_map:
-                            class_id = self.class_map[tag]
-                            categorized_targets[class_id].append(actor)
+                            cid = self.class_map[tag]
+                            categorized_actors[cid].append(actor)
+                            self.all_valid_actors.append((actor, cid))
                             break
                 
-                available_classes = [cid for cid, actors in categorized_targets.items() if len(actors) > 0]
-                if not available_classes:
-                    self.stop()
-                    return
+                if not self.all_valid_actors: return self.stop()
 
-                self.current_class_id = random.choice(available_classes)
-                self.current_actor = random.choice(categorized_targets[self.current_class_id])
-                class_name = list(self.class_map.keys())[list(self.class_map.values()).index(self.current_class_id)]
-
-                unreal.log(f"[{self.current_count + 1}/{self.total_images}] 锁定目标: {class_name}")
-
-                origin, extent = self.current_actor.get_actor_bounds(False, False)
+                available_classes = [cid for cid, actors in categorized_actors.items() if len(actors) > 0]
+                anchor_class_id = random.choice(available_classes)
+                anchor_actor = random.choice(categorized_actors[anchor_class_id])
                 
-                if class_name in ["Tower", "Turbine"]:
-                    radius = random.uniform(extent.z * 3.0, extent.z * 6.0)
-                    height_offset = random.uniform(0.0, extent.z * 1.5)
-                else:
-                    max_size = max(extent.x, extent.y, extent.z) 
-                    radius = random.uniform(max_size * 2.0, max_size * 5.0)
-                    height_offset = random.uniform(max_size * 0.2, max_size * 2.0)
+                origin, extent = anchor_actor.get_actor_bounds(False, False)
+                max_size = max(extent.x, extent.y, extent.z)
                 
-                angle = random.uniform(0, 360)
-                cam_x = origin.x + radius * math.cos(math.radians(angle))
-                cam_y = origin.y + radius * math.sin(math.radians(angle))
+                # 【核心修改 3：针对不同体积地物的精准距控制】
+                if anchor_class_id in [0, 1]:  
+                    distance = random.uniform(extent.z * 2.0, extent.z * 5.0)
+                elif anchor_class_id == 2:  
+                    distance = random.uniform(max_size * 4.0, max_size * 10.0)
+                elif anchor_class_id == 3:  
+                    # 彻底解决大船变成芝麻点的问题，死死压住倍数
+                    distance = random.uniform(max_size * 1.5, max_size * 3.5)
                 
-                min_ground_z = origin.z - extent.z * 0.8
-                cam_z = max(min_ground_z, origin.z + height_offset)
-                self.cam_loc = unreal.Vector(cam_x, cam_y, cam_z)
+                pitch = random.uniform(-89.0, -60.0)
+                yaw = random.uniform(0.0, 360.0)
                 
-                dx = origin.x - self.cam_loc.x
-                dy = origin.y - self.cam_loc.y
-                dz = origin.z - self.cam_loc.z
+                pitch_rad = math.radians(pitch)
+                yaw_rad = math.radians(yaw)
+                dir_x = math.cos(pitch_rad) * math.cos(yaw_rad)
+                dir_y = math.cos(pitch_rad) * math.sin(yaw_rad)
+                dir_z = math.sin(pitch_rad)
                 
-                yaw = math.degrees(math.atan2(dy, dx))
-                pitch = math.degrees(math.atan2(dz, math.sqrt(dx**2 + dy**2)))
+                offset_x = random.uniform(-extent.x, extent.x)
+                offset_y = random.uniform(-extent.y, extent.y)
+                target_focus = origin + unreal.Vector(offset_x, offset_y, 0)
+                
+                if anchor_class_id in [0, 1]:
+                    target_focus.z += extent.z * 0.5 
+                
+                self.cam_loc = target_focus - unreal.Vector(dir_x, dir_y, dir_z) * distance
                 self.cam_rot = unreal.Rotator(pitch=pitch, yaw=yaw, roll=0.0)
                 
                 self.editor_subsystem.set_level_viewport_camera_info(self.cam_loc, self.cam_rot)
-
+                
                 self.target_time = now + current_phase_wait
                 self.state = "WAIT_LOADING"
 
             elif self.state == "WAIT_LOADING":
                 if now >= self.target_time:
-                    if self.check_occlusion_multi_ray():
-                        self.state = "MOVE_CAMERA"
-                        return
-
-                    label_str = self.calculate_yolo_label()
+                    final_label_str = ""
+                    visible_count = 0
                     
-                    if label_str:
-                        # 3. 规范化文件命名：如 frame_001234.png
-                        file_basename = f"frame_{self.current_count:06d}"
+                    for actor, class_id in self.all_valid_actors:
+                        single_label = self.calculate_yolo_label_for_actor(actor, class_id)
+                        if single_label:
+                            final_label_str += single_label
+                            visible_count += 1
+                    
+                    if final_label_str != "":
+                        file_basename = f"frame_test_{self.current_count:04d}"
                         img_path = os.path.join(self.img_dir, file_basename + ".png")
                         lbl_path = os.path.join(self.lbl_dir, file_basename + ".txt")
 
-                        with open(lbl_path, "w") as f: f.write(label_str)
+                        with open(lbl_path, "w") as f: f.write(final_label_str)
 
                         unreal.AutomationLibrary.take_high_res_screenshot(int(self.res_x), int(self.res_y), img_path)
-                        unreal.log(f"-> 快门按下，保存: {file_basename}")
+                        unreal.log(f"[{self.current_count+1}/300] 抓拍成功！本张图框出 {visible_count} 个目标。")
                         
                         self.target_time = now + self.save_time
                         self.state = "WAIT_SCREENSHOT"
-                        
                     else:
                         self.state = "MOVE_CAMERA"
             
             elif self.state == "WAIT_SCREENSHOT":
                 if now >= self.target_time:
-                    # 4. 强制垃圾回收，降低内存压力
-                    unreal.SystemLibrary.collect_garbage()
                     self.current_count += 1
                     self.state = "MOVE_CAMERA"
 
@@ -340,14 +326,13 @@ class UltimateGoldenProduction:
             self.stop()
 
     def stop(self):
-        if unreal._ultimate_golden_production:
-            unreal.unregister_slate_post_tick_callback(unreal._ultimate_golden_production)
-            unreal._ultimate_golden_production = None
+        if unreal._golden_batch_tick_handle:
+            unreal.unregister_slate_post_tick_callback(unreal._golden_batch_tick_handle)
+            unreal._golden_batch_tick_handle = None
 
     def start(self):
         self.ensure_directories()
-        unreal.log(f"=== 开始 完整数据集生成测试 (共 {self.total_images} 张) ===")
-        unreal._ultimate_golden_production = unreal.register_slate_post_tick_callback(self._on_tick)
+        unreal.log(f"=== 开始 最终量产版: 300张 全局扫描数据集生成 ===")
+        unreal._golden_batch_tick_handle = unreal.register_slate_post_tick_callback(self._on_tick)
 
-unreal._ultimate_golden_production = None
-UltimateGoldenProduction().start()
+ExhaustiveBirdseyeGenerator().start()
